@@ -143,6 +143,17 @@ def rmse(y_pred, y_true):
     e = y_pred - y_true
     return float(np.sqrt(np.mean(e**2)))
 
+def mape(y_pred, y_true):
+    """Mean Absolute Percentage Error (%)"""
+    y_pred = np.asarray(y_pred, float)
+    y_true = np.asarray(y_true, float)
+    # Avoid division by zero
+    mask = y_true != 0
+    if not mask.any():
+        return np.nan
+    pct_err = np.abs((y_pred[mask] - y_true[mask]) / y_true[mask]) * 100
+    return float(np.mean(pct_err))
+
 # ---- Main ----
 def main():
     meta = pd.read_csv(META_CSV)
@@ -173,7 +184,9 @@ def main():
 
     df = pd.DataFrame(records)
     df["err_mm"] = df["pred_mm"] - df["gt_caliber_mm"]
+    df["pct_err"] = (np.abs(df["err_mm"]) / df["gt_caliber_mm"]) * 100
     overall_rmse = rmse(df["pred_mm"].values, df["gt_caliber_mm"].values)
+    overall_mape = mape(df["pred_mm"].values, df["gt_caliber_mm"].values)
 
     print(f"\nFixed preprocessing:"
           f" erode_px={ERODE_PX}, trim={TRIM_FRAC}, band_mm={BAND_MM}, border_margin_px={BORDER_MARGIN_PX}")
@@ -181,6 +194,8 @@ def main():
     print(f"RMSE (mm): {overall_rmse:.2f}")
     print(f"Median Abs Error (mm): {np.median(np.abs(df['err_mm'])):.2f}")
     print(f"Mean Abs Error (mm): {np.mean(np.abs(df['err_mm'])):.2f}")
+    print(f"Mean Abs Percentage Error (%): {overall_mape:.2f}")
+    print(f"Median Abs Percentage Error (%): {np.median(df['pct_err']):.2f}")
 
     # Save per-sample table
     out_csv = ROOT / "berries_inner_major_fixed_rmse.csv"
