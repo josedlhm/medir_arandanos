@@ -10,7 +10,7 @@ from detectron2.engine import DefaultPredictor
 from detectron2.config import get_cfg
 
 # --- preprocessing utils ---
-from utils.pre_processing import (
+from utils.pre_processing_original import (
     depth_mask_to_points_mm,
     keep_near_core_depth_mm,   # core-depth band-pass
 )
@@ -21,9 +21,9 @@ from utils.measure import inner_ellipsoid_major_diameter_mm
 # ============================
 # FIXED PARAMS (from your berries tuning)
 # ============================
-ERODE_PX  = 6             # increased to remove more edge pixels (background)
-TRIM_FRAC = 0.15          # increased to remove more depth outliers
-BAND_MM   = 6.0           # reduced from 12.0 to exclude background/foreground noise
+ERODE_PX  = 5             # slightly reduced to reduce underestimation while still filtering edge noise
+TRIM_FRAC = 0.12          # slightly reduced to keep more depth data for better core estimate
+BAND_MM   = 7.0           # slightly increased to include a bit more surface area (berries up to 24mm)
 BORDER_MARGIN_PX = 2     # skip detections within this many px of the image edge
 MIN_PTS = 50             # minimum 3D points after filtering to accept a frame
 MIN_VALID_FRAMES = 1     # per-sample minimum frames to keep the sample

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# eval_berries_rmse_fixed.py
+# eval_berries_rmse_paperstyle.py
+
 from pathlib import Path
 import cv2
 import numpy as np
@@ -9,25 +10,33 @@ import torch
 from detectron2.engine import DefaultPredictor
 from detectron2.config import get_cfg
 
-# --- preprocessing utils ---
-from utils.pre_processing import (
-    depth_mask_to_points_mm,
-    keep_near_core_depth_mm,   # core-depth band-pass
-)
+# --- paper-style preprocessing (steps 3–6, mm) ---
+from utils.pre_processing_paper import preprocess_berry_pointcloud_mm
 
 # --- measurement utils (uses your inner-ellipsoid major diameter) ---
 from utils.measure import inner_ellipsoid_major_diameter_mm
 
 # ============================
-# FIXED PARAMS (from your berries tuning)
+# PAPER-STYLE PREPROCESS PARAMS (mm)
+# tuned for blueberries (14–24mm) @ ~40cm ZED Mini X
+# Following paper: bilateral filter, depth discontinuity filter, radial outlier removal, median distance filter
 # ============================
-ERODE_PX  = 6             # increased to remove more edge pixels (background)
-TRIM_FRAC = 0.15          # increased to remove more depth outliers
-BAND_MM   = 6.0           # reduced from 12.0 to exclude background/foreground noise
-BORDER_MARGIN_PX = 2     # skip detections within this many px of the image edge
-MIN_PTS = 50             # minimum 3D points after filtering to accept a frame
-MIN_VALID_FRAMES = 1     # per-sample minimum frames to keep the sample
-GT_COL_FALLBACK = "caliber_mm"  # if gt_caliber_mm not present
+BIL_D = 5                      # moderate smoothing to reduce noise
+BIL_SIGMA_COLOR_MM = 6.0       # balanced - smooth noise but preserve berry shape
+BIL_SIGMA_SPACE_PX = 5.0       # moderate spatial smoothing
+
+DISC_THR_MM = 12.0             # balanced - remove obvious discontinuities but keep berry edges
+DISC_KSIZE = 3
+
+ROR_RADIUS_MM = 6.0            # larger radius - berries are 14-24mm, so 6mm is ~25-40% of diameter
+ROR_MIN_NEIGHBORS = 3         # very low - only remove truly isolated noise points
+
+MED_K = 6.0                    # very permissive - keep edge points that define berry size
+
+MIN_PTS = 50
+BORDER_MARGIN_PX = 2
+MIN_VALID_FRAMES = 1
+GT_COL_FALLBACK = "caliber_mm"
 # ============================
 
 # ---- Dataset / Model Config (berries) ----
@@ -37,7 +46,7 @@ META_CSV = ROOT / "metadata.csv"
 WEIGHTS = "./weights/arandanos_medidas.pth"
 CONFIG  = "./weights/arandanos_medidas.yaml"
 fx, fy, cx, cy = (1272.44, 1272.67, 920.062, 618.949)  # intrinsics (px; depth in mm)
-MASKS_OUTPUT = ROOT / "masks_visualization"  # directory for saved mask images
+MASKS_OUTPUT = ROOT / "masks_visualization"
 
 # ---- Detectron2 predictor ----
 def load_predictor():
@@ -56,9 +65,6 @@ predictor = load_predictor()
 
 # ---- Utilities ----
 def pick_mask(outputs, class_id_keep=None):
-    """
-    Return uint8 {0,255} mask for the target instance (largest or class-filtered).
-    """
     inst = outputs["instances"].to("cpu")
     if len(inst) == 0:
         return None
@@ -74,100 +80,80 @@ def pick_mask(outputs, class_id_keep=None):
     return (masks[idx].astype(np.uint8) * 255)
 
 def mask_touches_border(mask_u8: np.ndarray, margin_px: int = 1) -> bool:
-    """True if any positive pixel lies within 'margin_px' of image border."""
     if mask_u8 is None:
         return True
     h, w = mask_u8.shape[:2]
-    m = max(1, margin_px)
+    m = max(1, int(margin_px))
     return (mask_u8[:m, :].any() or mask_u8[h-m:, :].any()
             or mask_u8[:, :m].any() or mask_u8[:, w-m:].any())
 
 def save_mask_image(img_bgr: np.ndarray, mask: np.ndarray, sample_id: str, frame_name: str, pred_diameter: float):
-    """Save a visualization of the mask overlaid on the original image."""
-    # Create output directory if it doesn't exist
     MASKS_OUTPUT.mkdir(parents=True, exist_ok=True)
-    
-    # Convert mask to 3-channel for overlay
+
     mask_colored = np.zeros_like(img_bgr)
-    mask_colored[:, :, 1] = mask  # Green channel
-    
-    # Create overlay (50% transparency)
+    mask_colored[:, :, 1] = mask  # green
     overlay = cv2.addWeighted(img_bgr, 0.6, mask_colored, 0.4, 0)
-    
-    # Resize if too large (max width 800px for reasonable file size)
+
     h, w = overlay.shape[:2]
     max_width = 800
     if w > max_width:
         scale = max_width / w
-        new_w = max_width
-        new_h = int(h * scale)
-        overlay = cv2.resize(overlay, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    
-    # Add text with sample ID and predicted diameter
-    font = cv2.FONT_HERSHEY_SIMPLEX
+        overlay = cv2.resize(overlay, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
+
     text = f"Sample {sample_id}, d={pred_diameter:.2f}mm"
-    cv2.putText(overlay, text, (10, 30), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(overlay, text, (10, 30), font, 0.7, (0, 255, 0), 1, cv2.LINE_AA)
-    
-    # Save image
+    cv2.putText(overlay, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(overlay, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1, cv2.LINE_AA)
+
     output_path = MASKS_OUTPUT / f"sample_{sample_id}_{frame_name}.png"
     cv2.imwrite(str(output_path), overlay)
 
 def per_sample_prediction(sample_row, save_mask=False):
-    """Return median predicted diameter (mm) for a sample, or np.nan if invalid."""
     sid = str(int(sample_row["sample_id"]))
-    img_dir  = (SAMPLES / sid / "images")
+    img_dir   = (SAMPLES / sid / "images")
     depth_dir = (SAMPLES / sid / "depth")
     if not img_dir.exists() or not depth_dir.exists():
-        return np.nan, 0  # no frames
+        return np.nan, 0
 
     vals = []
-    first_valid_frame = True  # Save mask for the first valid measurement
-    
+    first_valid_frame = True
+
     for img_path in sorted(img_dir.glob("*.png")):
         name = img_path.stem
         dpth_path = depth_dir / f"{name}.npy"
         if not dpth_path.exists():
             continue
 
-        img_bgr  = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        img_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
         if img_bgr is None:
             continue
-        depth_mm = np.load(dpth_path)
 
-        outputs  = predictor(img_bgr)
+        depth_mm = np.load(dpth_path).astype(np.float32)
+        # treat invalid depth as NaN (paper pipelines assume invalids are removed)
+        depth_mm[~np.isfinite(depth_mm)] = np.nan
+        depth_mm[depth_mm <= 0] = np.nan
+
+        outputs = predictor(img_bgr)
         raw_mask = pick_mask(outputs)
         if raw_mask is None:
             continue
 
-        # Guard: skip detections touching the image border
         if mask_touches_border(raw_mask, margin_px=BORDER_MARGIN_PX):
             continue
 
-        inlier = (raw_mask > 0)
-        pts = depth_mask_to_points_mm(depth_mm, inlier, fx, fy, cx, cy)  # (N,3) mm
-        if pts.shape[0] < MIN_PTS:
-            continue
-
-        # fixed core-depth band-pass
-        pts = keep_near_core_depth_mm(
-            pts, depth_mm, raw_mask,
-            erode_px=ERODE_PX, trim=TRIM_FRAC, band_mm=BAND_MM
+        # Paper-style preprocessing (as described in paper)
+        pts, dbg = preprocess_berry_pointcloud_mm(
+            depth_mm, raw_mask, fx, fy, cx, cy,
+            bilateral_d=BIL_D,
+            bilateral_sigma_color_mm=BIL_SIGMA_COLOR_MM,
+            bilateral_sigma_space_px=BIL_SIGMA_SPACE_PX,
+            disc_thr_mm=DISC_THR_MM,
+            disc_ksize=DISC_KSIZE,
+            ror_radius_mm=ROR_RADIUS_MM,
+            ror_min_neighbors=ROR_MIN_NEIGHBORS,
+            med_k=MED_K,
+            min_pts=MIN_PTS,
         )
-        if pts.shape[0] < MIN_PTS:
-            continue
-
-        # Additional outlier removal: remove points far from centroid
-        if pts.shape[0] > MIN_PTS:
-            centroid = pts.mean(axis=0)
-            distances = np.linalg.norm(pts - centroid, axis=1)
-            # Keep points within 2.5 MAD of median distance
-            med_dist = np.median(distances)
-            mad_dist = np.median(np.abs(distances - med_dist)) + 1e-6
-            keep_mask = distances <= (med_dist + 2.5 * mad_dist)
-            pts = pts[keep_mask]
-            
-        if pts.shape[0] < MIN_PTS:
+        if dbg.get("reason") != "ok":
             continue
 
         # measure (inner-ellipsoid major diameter)
@@ -177,11 +163,9 @@ def per_sample_prediction(sample_row, save_mask=False):
             d_mm = np.nan
 
         if np.isfinite(d_mm):
-            vals.append(d_mm)
-            
-            # Save mask visualization for first valid measurement
+            vals.append(float(d_mm))
             if save_mask and first_valid_frame:
-                save_mask_image(img_bgr, raw_mask, sid, name, d_mm)
+                save_mask_image(img_bgr, raw_mask, sid, name, float(d_mm))
                 first_valid_frame = False
 
     if len(vals) < MIN_VALID_FRAMES:
@@ -196,22 +180,18 @@ def rmse(y_pred, y_true):
     return float(np.sqrt(np.mean(e**2)))
 
 def mape(y_pred, y_true):
-    """Mean Absolute Percentage Error (%)"""
     y_pred = np.asarray(y_pred, float)
     y_true = np.asarray(y_true, float)
-    # Avoid division by zero
     mask = y_true != 0
     if not mask.any():
         return np.nan
     pct_err = np.abs((y_pred[mask] - y_true[mask]) / y_true[mask]) * 100
     return float(np.mean(pct_err))
 
-# ---- Main ----
 def main():
     meta = pd.read_csv(META_CSV)
     gt_col = "gt_caliber_mm" if "gt_caliber_mm" in meta.columns else GT_COL_FALLBACK
 
-    # collect samples that exist on disk
     rows = [
         row for _, row in meta.iterrows()
         if (SAMPLES / str(int(row["sample_id"])) / "images").exists()
@@ -228,7 +208,7 @@ def main():
         status = "ok" if np.isfinite(pred) else "skip"
         print(f"[{status}] sample {sid}: frames_used={nframes}, pred={pred if np.isfinite(pred) else 'NaN'}")
         if np.isfinite(pred):
-            records.append({"sample_id": sid, "gt_caliber_mm": gt, "pred_mm": pred, "frames_used": nframes})
+            records.append({"sample_id": sid, "gt_caliber_mm": gt, "pred_mm": pred})
 
     if not records:
         print("No valid predictions after guards.")
@@ -237,28 +217,31 @@ def main():
     df = pd.DataFrame(records)
     df["err_mm"] = df["pred_mm"] - df["gt_caliber_mm"]
     df["pct_err"] = (np.abs(df["err_mm"]) / df["gt_caliber_mm"]) * 100
+
     overall_rmse = rmse(df["pred_mm"].values, df["gt_caliber_mm"].values)
     overall_mape = mape(df["pred_mm"].values, df["gt_caliber_mm"].values)
 
-    print(f"\nFixed preprocessing:"
-          f" erode_px={ERODE_PX}, trim={TRIM_FRAC}, band_mm={BAND_MM}, border_margin_px={BORDER_MARGIN_PX}")
+    print("\nPaper-style preprocessing (mm):")
+    print(f"  bilateral: d={BIL_D}, sigmaColor={BIL_SIGMA_COLOR_MM}mm, sigmaSpace={BIL_SIGMA_SPACE_PX}px")
+    print(f"  discontinuity: thr={DISC_THR_MM}mm, ksize={DISC_KSIZE}")
+    print(f"  radius outlier: radius={ROR_RADIUS_MM}mm, min_neighbors={ROR_MIN_NEIGHBORS}")
+    print(f"  median dist: k={MED_K}")
+    print(f"  border_margin_px={BORDER_MARGIN_PX}, min_pts={MIN_PTS}")
     print(f"Samples evaluated: {len(df)}")
     print(f"RMSE (mm): {overall_rmse:.2f}")
     print(f"Median Abs Error (mm): {np.median(np.abs(df['err_mm'])):.2f}")
     print(f"Mean Abs Error (mm): {np.mean(np.abs(df['err_mm'])):.2f}")
     print(f"Mean Abs Percentage Error (%): {overall_mape:.2f}")
     print(f"Median Abs Percentage Error (%): {np.median(df['pct_err']):.2f}")
-    
-    # Diagnostic statistics
-    print(f"\n--- Diagnostic Statistics ---")
+
+    print("\n--- Diagnostic Statistics ---")
     print(f"GT diameter range: {df['gt_caliber_mm'].min():.2f} - {df['gt_caliber_mm'].max():.2f} mm (mean: {df['gt_caliber_mm'].mean():.2f})")
     print(f"Pred diameter range: {df['pred_mm'].min():.2f} - {df['pred_mm'].max():.2f} mm (mean: {df['pred_mm'].mean():.2f})")
     print(f"Bias (pred - gt mean): {df['pred_mm'].mean() - df['gt_caliber_mm'].mean():.2f} mm")
     print(f"  → {'UNDERESTIMATING' if df['pred_mm'].mean() < df['gt_caliber_mm'].mean() else 'OVERESTIMATING'}")
     print(f"\nCorrelation coefficient: {np.corrcoef(df['pred_mm'], df['gt_caliber_mm'])[0,1]:.3f}")
 
-    # Save per-sample table
-    out_csv = ROOT / "berries_inner_major_fixed_rmse.csv"
+    out_csv = ROOT / "berries_inner_major_paperstyle_rmse.csv"
     df.to_csv(out_csv, index=False)
     print(f"\n📄 Saved per-sample results to: {out_csv}")
 
